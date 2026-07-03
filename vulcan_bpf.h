@@ -126,10 +126,9 @@ static __always_inline void vulcan_ewma_update(struct vulcan_ewma *e,
         e->value = val;
         e->initialized = 1;
     } else {
-        e->value = vulcan_sdiv(
-            (s64)alpha * val +
-            (s64)(VULCAN_FP_SCALE - alpha) * e->value,
-            VULCAN_FP_SCALE);
+        // Divide each term first to avoid overflow when alpha * val exceeds s64.
+        e->value = vulcan_sdiv((s64)alpha * val, VULCAN_FP_SCALE) +
+                   vulcan_sdiv((s64)(VULCAN_FP_SCALE - alpha) * e->value, VULCAN_FP_SCALE);
     }
 }
 
@@ -281,7 +280,7 @@ static __always_inline void
 vulcan_folio_on_access(struct vulcan_folio_metadata *meta, u64 now,
                        const struct vulcan_folio_config *cfg)
 {
-    if (meta->last_access_ts > 0 && meta->access_count > 0) {
+    if (meta->access_count > 1) {
         s64 interval = (s64)(now - meta->last_access_ts);
         if (cfg->listener_mask & VULCAN_LISTENER_MINMAX)
             vulcan_minmax_update(&meta->interval_minmax, interval);
