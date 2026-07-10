@@ -226,50 +226,49 @@ vulcan_rw_get_count(const struct vulcan_rolling_window *rw)
 // ============================================================================
 
 struct vulcan_folio_metadata {
+    /* static: set once at insertion, never change */
+    u64 insertion_ts;
+    u32 size_pages;    /* folio_nr_pages at insertion time */
+    u8  is_anonymous;  /* 1 = anon (heap/stack), 0 = file-backed */
+    u8  _pad0[3];
+
+    /* dynamic: updated on each access */
     u64 last_access_ts;
     u64 prev_access_ts;
     u32 access_count;
-    u32 client_tag; /* 0 = unset; else inode watch tag (DB / workload id) */
+    u32 client_tag;    /* 0 = unset; else inode number as workload id */
+    s32 refcount_snap; /* snapshot of folio->_refcount at last access */
+    s32 mapcount_snap; /* snapshot of folio->_mapcount at last access */
+
+    /* event-driven: incremented on each eviction */
+    u32 eviction_count;
+    u32 _pad1;
+
+    /* listener state for inter-access interval */
     struct vulcan_minmax interval_minmax;
     struct vulcan_ewma   interval_ewma;
 };
 
 /*
-* interval_minmax is the min and max interval between two accesses.
-* interval_ewma is the EWMA of the interval between two accesses.
-* low EWMA- frequent access
-* high EWMA- rare access
-*/
+ * interval_minmax / interval_ewma track the time gap between consecutive
+ * accesses to the same folio.  Low EWMA = frequent access (hot).
+ * High EWMA = rare access (cold, eviction candidate).
+ */
 
-/*
-
-- last access timestamp
-- prev access timestamp
-- access count
-- client tag
-- interval_minmax = { .min_val = 0, .max_val = 0, .count = 0, ._pad = 0 }
-State for min/max of access intervals:
-min_val: smallest interval seen so far
-max_val: largest interval seen so far
-count: how many interval samples have been incorporated
-_pad: padding/alignment field for struct layout
-
-interval_ewma = { .value = 0, .initialized = 0, ._pad = 0 }
-State for EWMA of access intervals:
-value: current EWMA value
-initialized: flag indicating whether EWMA has received its first real sample
-_pad: padding/alignment field
-(time gap between consecutive accesses to the same object/folio)
-
-*/
 static __always_inline struct vulcan_folio_metadata
-vulcan_folio_init(u64 now)
+vulcan_folio_init(u64 now, u32 size_pages, u8 is_anonymous, u32 client_tag)
 {
     struct vulcan_folio_metadata m = {
+        .insertion_ts    = now,
+        .size_pages      = size_pages ? size_pages : 1,
+        .is_anonymous    = is_anonymous,
         .last_access_ts  = now,
         .prev_access_ts  = 0,
         .access_count    = 1,
-        .client_tag      = 0,
+        .client_tag      = client_tag,
+        .refcount_snap   = 0,
+        .mapcount_snap   = 0,
+        .eviction_count  = 0,
         .interval_minmax = { .min_val = 0, .max_val = 0, .count = 0, ._pad = 0 },
         .interval_ewma   = { .value = 0, .initialized = 0, ._pad = 0 },
     };
@@ -278,6 +277,7 @@ vulcan_folio_init(u64 now)
 
 static __always_inline void
 vulcan_folio_on_access(struct vulcan_folio_metadata *meta, u64 now,
+                       s32 refcount, s32 mapcount,
                        const struct vulcan_folio_config *cfg)
 {
     if (meta->access_count > 1) {
@@ -287,9 +287,17 @@ vulcan_folio_on_access(struct vulcan_folio_metadata *meta, u64 now,
         if (cfg->listener_mask & VULCAN_LISTENER_EWMA)
             vulcan_ewma_update(&meta->interval_ewma, interval, cfg->ewma_alpha);
     }
-    meta->prev_access_ts = meta->last_access_ts;
-    meta->last_access_ts = now;
+    meta->prev_access_ts  = meta->last_access_ts;
+    meta->last_access_ts  = now;
     meta->access_count++;
+    meta->refcount_snap   = refcount;
+    meta->mapcount_snap   = mapcount;
+}
+
+static __always_inline void
+vulcan_folio_on_evict(struct vulcan_folio_metadata *meta)
+{
+    meta->eviction_count++;
 }
 
 #endif /* _VULCAN_BPF_H */

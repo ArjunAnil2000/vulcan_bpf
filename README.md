@@ -182,5 +182,5 @@ s64 min_interval  = vulcan_minmax_get_min(&meta->interval_minmax);
 | File | What it shows |
 |---|---|
 | [`examples/01_value_tracking.bpf.c`](examples/01_value_tracking.bpf.c) | Embed listeners directly in a map value struct; no feature dispatch |
-| [`examples/02_feature_store.bpf.c`](examples/02_feature_store.bpf.c) | Complete feature-store setup: define features, include headers, update, read |
-| [`examples/03_rank_score.bpf.c`](examples/03_rank_score.bpf.c) | Compose a cache-eviction score from per-folio and global network listeners |
+| [`examples/02_feature_store.bpf.c`](examples/02_feature_store.bpf.c) | Populate `vulcan_folio_metadata` via `folio_added`, `folio_accessed`, `folio_evicted` cache_ext hooks |
+| [`examples/03_rank_score.bpf.c`](examples/03_rank_score.bpf.c) | Compose an eviction score from access count, interval EWMA, folio size, eviction churn, and mapcount |

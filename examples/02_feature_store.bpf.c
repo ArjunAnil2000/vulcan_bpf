@@ -1,13 +1,14 @@
-// Example 02 — Feature store: full setup, update, and read
+// Example 02 — Per-folio feature tracking via cache_ext hooks
 //
-// Shows the complete pattern for using vulcan_feature.h:
-//   1. Define VULCAN_NUM_GLOBAL_FEATURES and a GF_* enum.
-//   2. Include vulcan_feature.h  →  listener maps are created automatically.
-//   3. Call vulcan_update_feature() on each new observation.
-//   4. Read back aggregated values with vulcan_get_*() accessors anywhere.
+// Populates vulcan_folio_metadata for every folio in the page cache by
+// hooking into the three cache_ext lifecycle callbacks:
 //
-// This example tracks two TCP metrics (segs_in, bytes_received) with different
-// listener combinations and reads them back in a decision function.
+//   folio_added    → vulcan_folio_init   (static fields + first timestamp)
+//   folio_accessed → vulcan_folio_on_access (dynamic fields + listeners)
+//   folio_evicted  → vulcan_folio_on_evict  (eviction_count)
+//
+// The resulting map (folio_meta_map) is consumed by the scoring function
+// in example 03.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -18,76 +19,113 @@
 char _license[] SEC("license") = "GPL";
 
 // --------------------------------------------------------------------------
-// Step 1: define the feature count and IDs
+// Per-folio metadata map  (shared with example 03)
 // --------------------------------------------------------------------------
 
-#define VULCAN_NUM_GLOBAL_FEATURES 2
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key,  u64);
+    __type(value, struct vulcan_folio_metadata);
+    __uint(max_entries, 500000);
+} folio_meta_map SEC(".maps");
 
-enum my_feature {
-    GF_SEGS_IN       = 0,
-    GF_BYTES_RECEIVED = 1,
+// --------------------------------------------------------------------------
+// Listener config
+// --------------------------------------------------------------------------
+
+static const struct vulcan_folio_config folio_cfg = {
+    .listener_mask = VULCAN_LISTENER_MINMAX | VULCAN_LISTENER_EWMA,
+    .ewma_alpha    = 200,   // α = 0.2
 };
 
 // --------------------------------------------------------------------------
-// Step 2: include the dispatch layer — listener maps are defined here
+// Helpers: extract static folio properties
 // --------------------------------------------------------------------------
 
-#include "vulcan_feature.h"
-
-// --------------------------------------------------------------------------
-// Step 3: per-feature listener configuration
-//   GF_SEGS_IN       → rolling window (last 8 samples) + EWMA
-//   GF_BYTES_RECEIVED → minmax + running average
-// --------------------------------------------------------------------------
-
-static const struct vulcan_feature_config feat_cfg[VULCAN_NUM_GLOBAL_FEATURES] = {
-    [GF_SEGS_IN]        = {
-        .listener_mask = VULCAN_LISTENER_RW | VULCAN_LISTENER_EWMA,
-        .ewma_alpha    = 150,    // slow-moving smoothing
-        .rw_size       = 8,
-    },
-    [GF_BYTES_RECEIVED] = {
-        .listener_mask = VULCAN_LISTENER_MINMAX | VULCAN_LISTENER_AVG,
-    },
-};
-
-// --------------------------------------------------------------------------
-// Step 4: update the feature store on each TCP receive event
-// --------------------------------------------------------------------------
-
-SEC("kprobe/tcp_recvmsg")
-int trace_tcp_recvmsg(struct pt_regs *ctx)
+static __always_inline u8 folio_is_anonymous(struct folio *folio)
 {
-    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-    if (!sk) return 0;
+    // Anonymous folios have PAGE_MAPPING_ANON (bit 0) set in mapping,
+    // or mapping is NULL.
+    struct address_space *mapping = BPF_CORE_READ(folio, mapping);
+    if (!mapping)
+        return 1;
+    return ((unsigned long)mapping & 1UL) ? 1 : 0;
+}
 
-    struct tcp_sock *tp = (struct tcp_sock *)sk;
-    s64 segs_in        = (s64)BPF_CORE_READ(tp, segs_in);
-    s64 bytes_received = (s64)BPF_CORE_READ(tp, bytes_received);
-
-    vulcan_update_feature(GF_SEGS_IN,        segs_in,        &feat_cfg[GF_SEGS_IN]);
-    vulcan_update_feature(GF_BYTES_RECEIVED,  bytes_received, &feat_cfg[GF_BYTES_RECEIVED]);
-    return 0;
+static __always_inline u32 folio_client_tag(struct folio *folio)
+{
+    // Use inode number as a workload identifier for file-backed folios.
+    struct address_space *mapping = BPF_CORE_READ(folio, mapping);
+    if (!mapping || ((unsigned long)mapping & 1UL))
+        return 0;
+    struct inode *host = BPF_CORE_READ(mapping, host);
+    if (!host)
+        return 0;
+    return (u32)BPF_CORE_READ(host, i_ino);
 }
 
 // --------------------------------------------------------------------------
-// Step 5: read aggregated values wherever you need them
+// folio_added: initialize metadata on insertion into page cache
 // --------------------------------------------------------------------------
 
-static __always_inline bool is_high_throughput(void)
+SEC("struct_ops/folio_added")
+void BPF_PROG(ce_folio_added, struct folio *folio)
 {
-    s64 avg_bytes = vulcan_get_avg(GF_BYTES_RECEIVED);
-    s64 max_bytes = vulcan_get_max(GF_BYTES_RECEIVED);
+    if (!folio)
+        return;
 
-    // Recent window average of segment count
-    s64 win_segs  = vulcan_get_window_avg(GF_SEGS_IN);
-    u32 win_n     = vulcan_get_window_count(GF_SEGS_IN);
+    u64 key  = (u64)folio;
+    u64 now  = bpf_ktime_get_ns();
 
-    // Require at least 4 samples before trusting the window
-    if (win_n < 4)
-        return false;
+    // size_pages: hardcoded to 1; large folio support requires kernel change.
+    u32 size_pages  = 1;
+    u8  is_anon     = folio_is_anonymous(folio);
+    u32 client_tag  = folio_client_tag(folio);
 
-    return avg_bytes > 1000000LL   // >1 MB average
-        && win_segs  > 100         // >100 segs in recent window
-        && max_bytes > 5000000LL;  // ever saw a burst >5 MB
+    struct vulcan_folio_metadata meta =
+        vulcan_folio_init(now, size_pages, is_anon, client_tag);
+
+    bpf_map_update_elem(&folio_meta_map, &key, &meta, BPF_NOEXIST);
+}
+
+// --------------------------------------------------------------------------
+// folio_accessed: update dynamic fields and listeners on each access
+// --------------------------------------------------------------------------
+
+SEC("struct_ops/folio_accessed")
+void BPF_PROG(ce_folio_accessed, struct folio *folio)
+{
+    if (!folio)
+        return;
+
+    u64 key = (u64)folio;
+    struct vulcan_folio_metadata *meta =
+        bpf_map_lookup_elem(&folio_meta_map, &key);
+    if (!meta)
+        return;
+
+    u64  now      = bpf_ktime_get_ns();
+    s32  refcount = BPF_CORE_READ(folio, _refcount.counter);
+    s32  mapcount = BPF_CORE_READ(folio, _mapcount.counter);
+
+    vulcan_folio_on_access(meta, now, refcount, mapcount, &folio_cfg);
+}
+
+// --------------------------------------------------------------------------
+// folio_evicted: increment eviction counter, keep metadata for re-insertion
+// --------------------------------------------------------------------------
+
+SEC("struct_ops/folio_evicted")
+void BPF_PROG(ce_folio_evicted, struct folio *folio)
+{
+    if (!folio)
+        return;
+
+    u64 key = (u64)folio;
+    struct vulcan_folio_metadata *meta =
+        bpf_map_lookup_elem(&folio_meta_map, &key);
+    if (!meta)
+        return;
+
+    vulcan_folio_on_evict(meta);
 }
