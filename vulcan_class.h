@@ -271,7 +271,16 @@ static __always_inline void vulcan_class_member_added(u32 class_id)
         return;
     u32 *cnt = bpf_map_lookup_elem(&vulcan_class_count, &class_id);
     if (cnt) {
-        __sync_fetch_and_add(cnt, 1);
+        // Plain, non-atomic increment — deliberate, not an oversight. Two
+        // things: (1) clang-14's BPF backend crashes lowering
+        // __sync_fetch_and_add/_sub on a u32 pulled from a map value in
+        // this context ("Cannot select: ... AtomicLoadSub ...", an LLVM
+        // backend limitation, not a verifier rejection); (2) even where
+        // it does compile, this counter is diagnostic/threshold-gating,
+        // not exact-precision — same cost/precision tradeoff already
+        // documented for manual g_* counters elsewhere in this project
+        // (small cross-CPU race, acceptable).
+        *cnt += 1;
     } else {
         u32 one = 1;
         bpf_map_update_elem(&vulcan_class_count, &class_id, &one, BPF_ANY);
@@ -284,7 +293,7 @@ static __always_inline void vulcan_class_member_removed(u32 class_id)
         return;
     u32 *cnt = bpf_map_lookup_elem(&vulcan_class_count, &class_id);
     if (cnt && *cnt > 0)
-        __sync_fetch_and_sub(cnt, 1);
+        *cnt -= 1;  // non-atomic — see vulcan_class_member_added comment
 }
 
 static __always_inline u32 vulcan_get_class_count(u32 class_id)
