@@ -229,8 +229,9 @@ struct vulcan_folio_metadata {
     /* static: set once at insertion, never change */
     u64 insertion_ts;
     u32 size_pages;    /* folio_nr_pages at insertion time */
+    u32 class_id;      /* policy-assigned class (e.g. scan vs non-scan) */
     u8  is_anonymous;  /* 1 = anon (heap/stack), 0 = file-backed */
-    u8  _pad0[3];
+    u8  _pad0[7];      /* pad to 8-byte align next u64 */
 
     /* dynamic: updated on each access */
     u64 last_access_ts;
@@ -256,11 +257,13 @@ struct vulcan_folio_metadata {
  */
 
 static __always_inline struct vulcan_folio_metadata
-vulcan_folio_init(u64 now, u32 size_pages, u8 is_anonymous, u32 client_tag)
+vulcan_folio_init(u64 now, u32 size_pages, u8 is_anonymous,
+                  u32 class_id, u32 client_tag)
 {
     struct vulcan_folio_metadata m = {
         .insertion_ts    = now,
         .size_pages      = size_pages ? size_pages : 1,
+        .class_id        = class_id,
         .is_anonymous    = is_anonymous,
         .last_access_ts  = now,
         .prev_access_ts  = 0,

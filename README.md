@@ -11,7 +11,8 @@ and network-aware scheduling policies.
 | Header | Purpose |
 |---|---|
 | `vulcan_bpf.h` | Listener primitives, config types, per-folio helpers. No map references. Include this standalone when you only need the low-level structs. |
-| `vulcan_feature.h` | Generic feature-store dispatch (`vulcan_update_feature`) and read-back accessors (`vulcan_get_*`). Defines the four global listener maps. Requires `VULCAN_NUM_GLOBAL_FEATURES` to be `#define`d before inclusion. |
+| `vulcan_feature.h` | Global feature-store dispatch (`vulcan_update_feature`) and read-back accessors (`vulcan_get_*`). Defines four global listener maps. Requires `VULCAN_NUM_GLOBAL_FEATURES` to be `#define`d before inclusion. |
+| `vulcan_class.h` | Class-level feature store — sits between per-folio and global. Aggregates listener statistics across all folios sharing a policy-assigned `class_id`. Uses hash maps keyed by `(class_id, feature_id)`. Requires `VULCAN_NUM_CLASS_FEATURES` and `VULCAN_MAX_CLASSES` before inclusion. |
 
 ---
 
@@ -160,7 +161,9 @@ designed for use in cache eviction hooks.
 
 ```c
 // On folio_added / first access:
-struct vulcan_folio_metadata meta = vulcan_folio_init(bpf_ktime_get_ns());
+struct vulcan_folio_metadata meta = vulcan_folio_init(
+    bpf_ktime_get_ns(), /*size_pages=*/1, /*is_anonymous=*/0,
+    /*class_id=*/0, /*client_tag=*/0);
 bpf_map_update_elem(&folio_metadata_map, &key, &meta, BPF_ANY);
 
 // On each subsequent folio_accessed:
@@ -168,12 +171,92 @@ static const struct vulcan_folio_config folio_cfg = {
     .listener_mask = VULCAN_LISTENER_MINMAX | VULCAN_LISTENER_EWMA,
     .ewma_alpha    = 200,
 };
-vulcan_folio_on_access(meta, bpf_ktime_get_ns(), &folio_cfg);
+vulcan_folio_on_access(meta, bpf_ktime_get_ns(), refcount, mapcount, &folio_cfg);
+
+// On folio_evicted, if you keep the metadata entry alive across eviction:
+vulcan_folio_on_evict(meta);
 
 // Reading back:
 s64 ewma_interval = vulcan_ewma_get(&meta->interval_ewma);
 s64 min_interval  = vulcan_minmax_get_min(&meta->interval_minmax);
+u32 size_pages    = meta->size_pages;      // set once at insertion
+s32 mapcount_snap = meta->mapcount_snap;   // refreshed on every access
+u32 eviction_count = meta->eviction_count; // only if vulcan_folio_on_evict is called
 ```
+
+---
+
+## Class-level tracking
+
+`vulcan_class.h` sits between per-folio and global: it aggregates listener
+statistics across every folio sharing a policy-assigned `class_id`, keyed by
+`(class_id, feature_id)`.
+
+### Step 1 — Define class/feature bounds and include
+
+```c
+#define VULCAN_NUM_CLASS_FEATURES 1
+#define VULCAN_MAX_CLASSES        4   // keep small — see header comment
+
+enum my_class_feature {
+    CF_ACCESS_INTERVAL = 0,
+};
+
+#include "vulcan_bpf.h"        // must come first
+#include "vulcan_class.h"      // defines maps + dispatch + accessors
+```
+
+### Step 2 — Assign a class_id
+
+Either derive one with a helper, or use your own policy-defined scheme
+(e.g. an explicit "is this PID a known scanner" map, as in
+`examples/02_feature_store.bpf.c`):
+
+```c
+u32 class_id = vulcan_class_from_pid(VULCAN_MAX_CLASSES);           // generic hash bucket
+u32 class_id = vulcan_class_from_size_bucket(size_pages, VULCAN_MAX_CLASSES);
+u32 class_id = vulcan_class_from_u64(some_key, VULCAN_MAX_CLASSES); // your own key
+```
+
+### Step 3 — Feed observations, track membership and freshness
+
+```c
+static const struct vulcan_feature_config class_cfg[VULCAN_NUM_CLASS_FEATURES] = {
+    [CF_ACCESS_INTERVAL] = { .listener_mask = VULCAN_LISTENER_EWMA, .ewma_alpha = 150 },
+};
+
+// On folio_added, once class_id is assigned:
+vulcan_class_member_added(class_id);
+
+// On each observation (e.g. folio_accessed):
+vulcan_update_class_feature(class_id, CF_ACCESS_INTERVAL, interval, &class_cfg[CF_ACCESS_INTERVAL]);
+vulcan_class_touch(class_id, now);   // for staleness tracking, see below
+
+// On folio_evicted:
+vulcan_class_member_removed(class_id);
+```
+
+### Step 4 — Read back
+
+```c
+s64 class_ewma = vulcan_get_class_ewma(class_id, CF_ACCESS_INTERVAL);
+u32 population  = vulcan_get_class_count(class_id);
+
+s64 top_score;
+u32 hottest_class = vulcan_class_top_by_ewma(CF_ACCESS_INTERVAL, &top_score);
+
+u32 biggest_pop;
+u32 largest_class = vulcan_class_top_by_count(&biggest_pop);
+
+if (vulcan_class_is_stale(class_id, now, /*ttl_ns=*/5000000000ULL)) {
+    vulcan_class_reset(class_id, CF_ACCESS_INTERVAL);
+}
+```
+
+`vulcan_class_top_by_*` scan all classes via `#pragma unroll` (a compile-time
+technique, not a runtime callback — see the header comment for why a generic
+"rank by arbitrary score function" API isn't portably legal in a header-only
+BPF library) and only consider classes with `vulcan_get_class_count() > 0`.
 
 ---
 
@@ -182,5 +265,6 @@ s64 min_interval  = vulcan_minmax_get_min(&meta->interval_minmax);
 | File | What it shows |
 |---|---|
 | [`examples/01_value_tracking.bpf.c`](examples/01_value_tracking.bpf.c) | Embed listeners directly in a map value struct; no feature dispatch |
-| [`examples/02_feature_store.bpf.c`](examples/02_feature_store.bpf.c) | Populate `vulcan_folio_metadata` via `folio_added`, `folio_accessed`, `folio_evicted` cache_ext hooks |
-| [`examples/03_rank_score.bpf.c`](examples/03_rank_score.bpf.c) | Compose an eviction score from access count, interval EWMA, folio size, eviction churn, and mapcount |
+| [`examples/02_feature_store.bpf.c`](examples/02_feature_store.bpf.c) | Populate `vulcan_folio_metadata` and a named 2-class (scan/general) class-level feature via `folio_added`, `folio_accessed`, `folio_evicted` cache_ext hooks |
+| [`examples/03_rank_score.bpf.c`](examples/03_rank_score.bpf.c) | Compose an eviction score from access count, interval EWMA (compared against its class average), folio size, eviction churn, and mapcount |
+| [`examples/04_class_helpers.bpf.c`](examples/04_class_helpers.bpf.c) | Generic PID-bucket classing via `vulcan_class_from_pid`, population count, `vulcan_class_top_by_ewma` ranking, and staleness/reset |

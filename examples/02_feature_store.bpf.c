@@ -1,14 +1,21 @@
-// Example 02 — Per-folio feature tracking via cache_ext hooks
+// Example 02 — Per-folio and class-level feature tracking via cache_ext hooks
 //
-// Populates vulcan_folio_metadata for every folio in the page cache by
-// hooking into the three cache_ext lifecycle callbacks:
+// Populates vulcan_folio_metadata and class-level listener aggregates for
+// every folio in the page cache by hooking into the cache_ext lifecycle
+// callbacks:
 //
-//   folio_added    → vulcan_folio_init   (static fields + first timestamp)
-//   folio_accessed → vulcan_folio_on_access (dynamic fields + listeners)
-//   folio_evicted  → vulcan_folio_on_evict  (eviction_count)
+//   folio_added    → assign class, vulcan_folio_init
+//   folio_accessed → vulcan_folio_on_access, vulcan_update_class_feature
+//   folio_evicted  → vulcan_folio_on_evict
 //
-// The resulting map (folio_meta_map) is consumed by the scoring function
-// in example 03.
+// Classes (mirroring the get_scan policy):
+//   CLASS_GENERAL = 0  — folios inserted by non-scan PIDs
+//   CLASS_SCAN    = 1  — folios inserted by scan PIDs
+//
+// Class feature tracked:
+//   CF_ACCESS_INTERVAL = 0  — EWMA of inter-access interval per class
+//
+// The resulting maps are consumed by the scoring function in example 03.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -16,7 +23,32 @@
 #include <bpf/bpf_core_read.h>
 #include "vulcan_bpf.h"
 
+// --------------------------------------------------------------------------
+// Class and class feature definitions
+// --------------------------------------------------------------------------
+
+#define CLASS_GENERAL 0
+#define CLASS_SCAN    1
+
+#define CF_ACCESS_INTERVAL 0
+
+#define VULCAN_NUM_CLASS_FEATURES 1
+#define VULCAN_MAX_CLASSES        2
+
+#include "vulcan_class.h"
+
 char _license[] SEC("license") = "GPL";
+
+// --------------------------------------------------------------------------
+// scan_pids map — populated by userspace to identify scan PIDs
+// --------------------------------------------------------------------------
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key,  u32);   // pid
+    __type(value, u8);   // 1 = is scan pid
+    __uint(max_entries, 1024);
+} scan_pids SEC(".maps");
 
 // --------------------------------------------------------------------------
 // Per-folio metadata map  (shared with example 03)
@@ -30,22 +62,27 @@ struct {
 } folio_meta_map SEC(".maps");
 
 // --------------------------------------------------------------------------
-// Listener config
+// Listener configs
 // --------------------------------------------------------------------------
 
 static const struct vulcan_folio_config folio_cfg = {
     .listener_mask = VULCAN_LISTENER_MINMAX | VULCAN_LISTENER_EWMA,
-    .ewma_alpha    = 200,   // α = 0.2
+    .ewma_alpha    = 200,
+};
+
+static const struct vulcan_feature_config class_cfg[VULCAN_NUM_CLASS_FEATURES] = {
+    [CF_ACCESS_INTERVAL] = {
+        .listener_mask = VULCAN_LISTENER_EWMA | VULCAN_LISTENER_AVG,
+        .ewma_alpha    = 150,
+    },
 };
 
 // --------------------------------------------------------------------------
-// Helpers: extract static folio properties
+// Helpers
 // --------------------------------------------------------------------------
 
 static __always_inline u8 folio_is_anonymous(struct folio *folio)
 {
-    // Anonymous folios have PAGE_MAPPING_ANON (bit 0) set in mapping,
-    // or mapping is NULL.
     struct address_space *mapping = BPF_CORE_READ(folio, mapping);
     if (!mapping)
         return 1;
@@ -54,7 +91,6 @@ static __always_inline u8 folio_is_anonymous(struct folio *folio)
 
 static __always_inline u32 folio_client_tag(struct folio *folio)
 {
-    // Use inode number as a workload identifier for file-backed folios.
     struct address_space *mapping = BPF_CORE_READ(folio, mapping);
     if (!mapping || ((unsigned long)mapping & 1UL))
         return 0;
@@ -64,8 +100,15 @@ static __always_inline u32 folio_client_tag(struct folio *folio)
     return (u32)BPF_CORE_READ(host, i_ino);
 }
 
+static __always_inline u32 current_class(void)
+{
+    u32 pid = (u32)bpf_get_current_pid_tgid();
+    u8 *is_scan = bpf_map_lookup_elem(&scan_pids, &pid);
+    return (is_scan && *is_scan) ? CLASS_SCAN : CLASS_GENERAL;
+}
+
 // --------------------------------------------------------------------------
-// folio_added: initialize metadata on insertion into page cache
+// folio_added: assign class, initialize metadata
 // --------------------------------------------------------------------------
 
 SEC("struct_ops/folio_added")
@@ -74,22 +117,20 @@ void BPF_PROG(ce_folio_added, struct folio *folio)
     if (!folio)
         return;
 
-    u64 key  = (u64)folio;
-    u64 now  = bpf_ktime_get_ns();
-
-    // size_pages: hardcoded to 1; large folio support requires kernel change.
-    u32 size_pages  = 1;
-    u8  is_anon     = folio_is_anonymous(folio);
-    u32 client_tag  = folio_client_tag(folio);
+    u64 key       = (u64)folio;
+    u64 now       = bpf_ktime_get_ns();
+    u32 class_id  = current_class();
+    u8  is_anon   = folio_is_anonymous(folio);
+    u32 client_tag = folio_client_tag(folio);
 
     struct vulcan_folio_metadata meta =
-        vulcan_folio_init(now, size_pages, is_anon, client_tag);
+        vulcan_folio_init(now, /*size_pages=*/1, is_anon, class_id, client_tag);
 
     bpf_map_update_elem(&folio_meta_map, &key, &meta, BPF_NOEXIST);
 }
 
 // --------------------------------------------------------------------------
-// folio_accessed: update dynamic fields and listeners on each access
+// folio_accessed: update per-folio listeners and class-level features
 // --------------------------------------------------------------------------
 
 SEC("struct_ops/folio_accessed")
@@ -104,15 +145,23 @@ void BPF_PROG(ce_folio_accessed, struct folio *folio)
     if (!meta)
         return;
 
-    u64  now      = bpf_ktime_get_ns();
-    s32  refcount = BPF_CORE_READ(folio, _refcount.counter);
-    s32  mapcount = BPF_CORE_READ(folio, _mapcount.counter);
+    u64 now      = bpf_ktime_get_ns();
+    s32 refcount = BPF_CORE_READ(folio, _refcount.counter);
+    s32 mapcount = BPF_CORE_READ(folio, _mapcount.counter);
 
     vulcan_folio_on_access(meta, now, refcount, mapcount, &folio_cfg);
+
+    // Feed the inter-access interval into the class-level listener so the
+    // scoring function can compare a folio's hotness against its class average.
+    if (meta->access_count > 1) {
+        s64 interval = (s64)(now - meta->prev_access_ts);
+        vulcan_update_class_feature(meta->class_id, CF_ACCESS_INTERVAL,
+                                    interval, &class_cfg[CF_ACCESS_INTERVAL]);
+    }
 }
 
 // --------------------------------------------------------------------------
-// folio_evicted: increment eviction counter, keep metadata for re-insertion
+// folio_evicted: increment eviction counter
 // --------------------------------------------------------------------------
 
 SEC("struct_ops/folio_evicted")
