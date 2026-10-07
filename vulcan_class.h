@@ -417,4 +417,241 @@ static __always_inline void vulcan_class_reset(u32 class_id, u32 feature_id)
     bpf_map_delete_elem(&vulcan_crw, &key);
 }
 
+// ============================================================================
+// Class-level mirror of struct vulcan_folio_metadata
+//
+// vulcan_update_class_feature() above requires the caller to define its own
+// feature IDs, a VULCAN_NUM_CLASS_FEATURES count, and a vulcan_feature_config
+// array. This section skips all of that for one specific, common case:
+// aggregating the SAME raw signals struct vulcan_folio_metadata
+// (vulcan_bpf.h) already tracks per folio — insertion_ts, size_pages,
+// is_anonymous, last_access_ts, prev_access_ts, access_count, client_tag,
+// refcount_snap, mapcount_snap, eviction_count — per class_id instead of
+// per folio, with all 4 listeners (MinMax/EWMA/Avg/RollingWindow) running
+// automatically on every signal. No per-feature config needed: call the
+// three lifecycle functions below from the matching cache_ext hook and pass
+// the folio's own (already-updated) vulcan_folio_metadata.
+//
+// A class's VULCAN_CM_LAST_ACCESS_TS, e.g., is the most recent access
+// timestamp across every folio currently classed into that bucket (by
+// whatever derivation the caller used — vulcan_class_from_pid,
+// vulcan_class_from_u64, vulcan_class_from_size_bucket, or its own scheme).
+//
+// Independent, fixed-size maps (VULCAN_MAX_CLASSES x 10 signals) — does not
+// share storage with vulcan_update_class_feature()'s caller-defined feature
+// IDs above, so the two APIs can be used side by side without collision.
+//
+// Usage:
+//   folio_added:    vulcan_class_meta_on_folio_added(class_id, &meta)
+//   folio_accessed: vulcan_class_meta_on_folio_accessed(class_id, &meta)
+//                   (call AFTER vulcan_folio_on_access, so meta's dynamic
+//                   fields are already refreshed for this access)
+//   folio_evicted:  vulcan_class_meta_on_folio_evicted(class_id, &meta)
+//                   (call AFTER vulcan_folio_on_evict, so eviction_count
+//                   already reflects this eviction)
+// ============================================================================
+
+#define VULCAN_CLASS_META_NUM_SIGNALS 10
+
+enum vulcan_class_meta_signal {
+    VULCAN_CM_INSERTION_TS   = 0,
+    VULCAN_CM_SIZE_PAGES     = 1,
+    VULCAN_CM_IS_ANONYMOUS   = 2,
+    VULCAN_CM_LAST_ACCESS_TS = 3,
+    VULCAN_CM_PREV_ACCESS_TS = 4,
+    VULCAN_CM_ACCESS_COUNT   = 5,
+    VULCAN_CM_CLIENT_TAG     = 6,
+    VULCAN_CM_REFCOUNT_SNAP  = 7,
+    VULCAN_CM_MAPCOUNT_SNAP  = 8,
+    VULCAN_CM_EVICTION_COUNT = 9,
+};
+
+// Fixed listener parameters for this mirror — deliberately not
+// caller-configurable (that's the point: zero-config). Matches the
+// defaults used elsewhere in this library (vulcan_bpf.h's folio_cfg
+// convention, VULCAN_MAX_WINDOW headroom).
+#define VULCAN_CLASS_META_EWMA_ALPHA 200
+#define VULCAN_CLASS_META_RW_SIZE    8
+
+struct vulcan_class_meta_key {
+    u32 class_id;
+    u32 signal_id;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, VULCAN_MAX_CLASSES * VULCAN_CLASS_META_NUM_SIGNALS);
+    __type(key,   struct vulcan_class_meta_key);
+    __type(value, struct vulcan_minmax);
+} vulcan_cm_minmax SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, VULCAN_MAX_CLASSES * VULCAN_CLASS_META_NUM_SIGNALS);
+    __type(key,   struct vulcan_class_meta_key);
+    __type(value, struct vulcan_ewma);
+} vulcan_cm_ewma SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, VULCAN_MAX_CLASSES * VULCAN_CLASS_META_NUM_SIGNALS);
+    __type(key,   struct vulcan_class_meta_key);
+    __type(value, struct vulcan_avg);
+} vulcan_cm_avg SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, VULCAN_MAX_CLASSES * VULCAN_CLASS_META_NUM_SIGNALS);
+    __type(key,   struct vulcan_class_meta_key);
+    __type(value, struct vulcan_rolling_window);
+} vulcan_cm_rw SEC(".maps");
+
+// Init-or-update against all 4 listener maps at once (see
+// vulcan_update_class_feature's own comment for why hash maps need this
+// pattern — no bpf_map_type with an implicit-zero-value lookup here).
+static __always_inline void
+vulcan_class_meta_update(u32 class_id, u32 signal_id, s64 val)
+{
+    if (class_id >= VULCAN_MAX_CLASSES || signal_id >= VULCAN_CLASS_META_NUM_SIGNALS)
+        return;
+
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+
+    struct vulcan_minmax *mm = bpf_map_lookup_elem(&vulcan_cm_minmax, &key);
+    if (mm) {
+        vulcan_minmax_update(mm, val);
+    } else {
+        struct vulcan_minmax init = {};
+        vulcan_minmax_update(&init, val);
+        bpf_map_update_elem(&vulcan_cm_minmax, &key, &init, BPF_ANY);
+    }
+
+    struct vulcan_ewma *ew = bpf_map_lookup_elem(&vulcan_cm_ewma, &key);
+    if (ew) {
+        vulcan_ewma_update(ew, val, VULCAN_CLASS_META_EWMA_ALPHA);
+    } else {
+        struct vulcan_ewma init = {};
+        vulcan_ewma_update(&init, val, VULCAN_CLASS_META_EWMA_ALPHA);
+        bpf_map_update_elem(&vulcan_cm_ewma, &key, &init, BPF_ANY);
+    }
+
+    struct vulcan_avg *avg = bpf_map_lookup_elem(&vulcan_cm_avg, &key);
+    if (avg) {
+        vulcan_avg_update(avg, val);
+    } else {
+        struct vulcan_avg init = {};
+        vulcan_avg_update(&init, val);
+        bpf_map_update_elem(&vulcan_cm_avg, &key, &init, BPF_ANY);
+    }
+
+    struct vulcan_rolling_window *rw = bpf_map_lookup_elem(&vulcan_cm_rw, &key);
+    if (rw) {
+        vulcan_rw_update(rw, val, VULCAN_CLASS_META_RW_SIZE);
+    } else {
+        struct vulcan_rolling_window init = {};
+        vulcan_rw_update(&init, val, VULCAN_CLASS_META_RW_SIZE);
+        bpf_map_update_elem(&vulcan_cm_rw, &key, &init, BPF_ANY);
+    }
+}
+
+// --- Lifecycle: call from the matching cache_ext hook ----------------------
+
+static __always_inline void
+vulcan_class_meta_on_folio_added(u32 class_id, const struct vulcan_folio_metadata *m)
+{
+    vulcan_class_meta_update(class_id, VULCAN_CM_INSERTION_TS, (s64)m->insertion_ts);
+    vulcan_class_meta_update(class_id, VULCAN_CM_SIZE_PAGES,   (s64)m->size_pages);
+    vulcan_class_meta_update(class_id, VULCAN_CM_IS_ANONYMOUS, (s64)m->is_anonymous);
+    vulcan_class_meta_update(class_id, VULCAN_CM_CLIENT_TAG,   (s64)m->client_tag);
+}
+
+static __always_inline void
+vulcan_class_meta_on_folio_accessed(u32 class_id, const struct vulcan_folio_metadata *m)
+{
+    vulcan_class_meta_update(class_id, VULCAN_CM_LAST_ACCESS_TS, (s64)m->last_access_ts);
+    vulcan_class_meta_update(class_id, VULCAN_CM_PREV_ACCESS_TS, (s64)m->prev_access_ts);
+    vulcan_class_meta_update(class_id, VULCAN_CM_ACCESS_COUNT,   (s64)m->access_count);
+    vulcan_class_meta_update(class_id, VULCAN_CM_REFCOUNT_SNAP,  (s64)m->refcount_snap);
+    vulcan_class_meta_update(class_id, VULCAN_CM_MAPCOUNT_SNAP,  (s64)m->mapcount_snap);
+}
+
+static __always_inline void
+vulcan_class_meta_on_folio_evicted(u32 class_id, const struct vulcan_folio_metadata *m)
+{
+    vulcan_class_meta_update(class_id, VULCAN_CM_EVICTION_COUNT, (s64)m->eviction_count);
+}
+
+// --- Accessors (naming mirrors vulcan_get_class_* above) -------------------
+
+static __always_inline s64 vulcan_class_meta_get_min(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_minmax *mm = bpf_map_lookup_elem(&vulcan_cm_minmax, &key);
+    return mm ? vulcan_minmax_get_min(mm) : 0;
+}
+
+static __always_inline s64 vulcan_class_meta_get_max(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_minmax *mm = bpf_map_lookup_elem(&vulcan_cm_minmax, &key);
+    return mm ? vulcan_minmax_get_max(mm) : 0;
+}
+
+static __always_inline s64 vulcan_class_meta_get_ewma(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_ewma *ew = bpf_map_lookup_elem(&vulcan_cm_ewma, &key);
+    return ew ? vulcan_ewma_get(ew) : 0;
+}
+
+static __always_inline s64 vulcan_class_meta_get_avg(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_avg *avg = bpf_map_lookup_elem(&vulcan_cm_avg, &key);
+    return avg ? vulcan_avg_get(avg) : 0;
+}
+
+static __always_inline s64 vulcan_class_meta_get_window_avg(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_rolling_window *rw = bpf_map_lookup_elem(&vulcan_cm_rw, &key);
+    return rw ? vulcan_rw_get_avg(rw) : 0;
+}
+
+static __always_inline u32 vulcan_class_meta_get_window_count(u32 class_id, u32 signal_id)
+{
+    struct vulcan_class_meta_key key = { .class_id = class_id, .signal_id = signal_id };
+    struct vulcan_rolling_window *rw = bpf_map_lookup_elem(&vulcan_cm_rw, &key);
+    return rw ? vulcan_rw_get_count(rw) : 0;
+}
+
+// Ranking counterpart to vulcan_class_top_by_ewma() above, but reading this
+// mirror's own vulcan_cm_ewma map instead of the caller-fed vulcan_cewma
+// map — needed because a policy using ONLY vulcan_class_meta_* (no calls to
+// vulcan_update_class_feature) would otherwise find vulcan_cewma empty.
+// vulcan_class_top_by_count() needs no counterpart: population tracking
+// (vulcan_class_member_added/_removed) is shared, not feature-store-specific.
+static __always_inline u32
+vulcan_class_meta_top_by_ewma(u32 signal_id, s64 *out_score)
+{
+    u32 best_id = 0;
+    s64 best = 0;
+    bool found = false;
+
+    #pragma unroll
+    for (u32 cid = 0; cid < VULCAN_MAX_CLASSES; cid++) {
+        if (vulcan_get_class_count(cid) == 0)
+            continue;
+        s64 v = vulcan_class_meta_get_ewma(cid, signal_id);
+        if (!found || v > best) {
+            best = v;
+            best_id = cid;
+            found = true;
+        }
+    }
+    if (out_score)
+        *out_score = best;
+    return best_id;
+}
+
 #endif /* _VULCAN_CLASS_H */
